@@ -425,7 +425,12 @@ def handle_client(conn):
 def run():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", LISTEN_PORT))
+    try:
+        srv.bind(("127.0.0.1", LISTEN_PORT))
+    except OSError as e:
+        print("[vless] bind failed (another server owns the port?), "
+              "not starting: %r" % (e,), flush=True)
+        return
     srv.listen(128)
     print("[vless] listening on 127.0.0.1:%d  ws_path=%s sub_path=%s" %
           (LISTEN_PORT, WS_PATH, SUB_PATH), flush=True)
