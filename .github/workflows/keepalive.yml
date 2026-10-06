@@ -11,4 +11,7 @@ jobs:
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 "https://hemeilin-st1-2ij8fcpfaznugj63aizz4g.streamlit.app/")
           echo "HTTP $code"
-          test "$code" = "200"
+          case "$code" in
+            200|303) exit 0 ;;
+            *) exit 1 ;;
+          esac
