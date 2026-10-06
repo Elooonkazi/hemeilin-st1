@@ -1,0 +1,14 @@
+name: keepalive
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping app
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 "https://hemeilin-st1-2ij8fcpfaznugj63aizz4g.streamlit.app/")
+          echo "HTTP $code"
+          test "$code" = "200"
