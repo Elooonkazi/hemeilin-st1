@@ -107,36 +107,6 @@ def _fetch_cloudflared(bot_path):
     return False
 
 
-def _run_tunnel(bot_path, port, log_path):
-    try:
-        if os.path.exists(log_path):
-            os.unlink(log_path)
-    except OSError:
-        pass
-    subprocess.Popen(
-        [bot_path, "tunnel", "--edge-ip-version", "auto", "--no-autoupdate",
-         "--protocol", "http2", "--logfile", log_path,
-         "--loglevel", "info", "--url", "http://127.0.0.1:%d" % port],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL, start_new_session=True)
-    print("[argo] tunnel process started", flush=True)
-
-
-def _wait_domain(log_path, timeout=90):
-    pat = re.compile(r"https?://([^ \t\r\n]*trycloudflare\.com)/?")
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                m = pat.search(f.read())
-                if m:
-                    return m.group(1)
-        except OSError:
-            pass
-        time.sleep(2)
-    return None
-
-
 def _print_links(domain):
     link = server.argo_link(domain)
     print("", flush=True)
@@ -153,6 +123,8 @@ def _print_links(domain):
 
 
 PIDFILE = os.path.join(CACHE_DIR, "tunnel.pid")
+LOCKFILE = os.path.join(CACHE_DIR, "boot.lock")
+_TRYCF_RE = re.compile(r"https?://([^ \t\r\n]*trycloudflare\.com)/?")
 
 
 def _pid_alive(pid):
@@ -190,57 +162,119 @@ def _port_in_use(port):
         s.close()
 
 
-def _existing_tunnel_domain(log_path):
-    """A tunnel process from an earlier boot in this container is still
-    alive: reuse its domain instead of opening a new tunnel (which would
-    change the public domain on every Streamlit script rerun)."""
-    pid = _read_pidfile()
-    if pid and _pid_alive(pid):
-        domain = _wait_domain(log_path, timeout=10)
-        if domain:
-            return domain
-        print("[argo] pidfile points to live pid %d but no domain in log; "
-              "starting a fresh tunnel" % pid, flush=True)
+def _take_boot_lock(timeout=180):
+    """Inter-thread AND inter-process boot mutex.
+
+    Streamlit reruns (page visits, code updates) can overlap: without this,
+    two boots race, each starts its own tunnel, and the public domain flips.
+    The boot runs in a daemon thread, so waiting here is harmless."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, ("%d %d" % (os.getpid(), time.time())).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(LOCKFILE)
+            except OSError:
+                continue
+            if age > 600:  # stale lock (holder died mid-boot); break it
+                try:
+                    os.unlink(LOCKFILE)
+                except OSError:
+                    pass
+                continue
+            time.sleep(2)
+    return False
+
+
+def _release_boot_lock():
+    try:
+        os.unlink(LOCKFILE)
+    except OSError:
+        pass
+
+
+def _marker(pid):
+    return "[argo] tunnel proc %d starting" % pid
+
+
+def _domain_for_pid(log_path, pid, timeout):
+    """Find the trycloudflare domain printed AFTER this pid's start marker.
+
+    The log is shared/appended by every boot; matching by marker keeps the
+    pid<->domain mapping exact even when several tunnels were started."""
+    mk = _marker(pid)
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            time.sleep(2)
+            continue
+        idx = content.rfind(mk)
+        if idx >= 0:
+            m = _TRYCF_RE.search(content, idx)
+            if m:
+                return m.group(1)
+        time.sleep(2)
     return None
 
 
 def _run_tunnel(bot_path, port, log_path):
-    try:
-        if os.path.exists(log_path):
-            os.unlink(log_path)
-    except OSError:
-        pass
     proc = subprocess.Popen(
         [bot_path, "tunnel", "--edge-ip-version", "auto", "--no-autoupdate",
          "--protocol", "http2", "--logfile", log_path,
          "--loglevel", "info", "--url", "http://127.0.0.1:%d" % port],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(_marker(proc.pid) + "\n")
+    except OSError:
+        pass
     _write_pidfile(proc.pid)
     print("[argo] tunnel process started (pid %d)" % proc.pid, flush=True)
+    return proc.pid
 
 
 def _run_named_tunnel(bot_path, token, log_path):
-    try:
-        if os.path.exists(log_path):
-            os.unlink(log_path)
-    except OSError:
-        pass
     proc = subprocess.Popen(
         [bot_path, "tunnel", "--no-autoupdate", "--logfile", log_path,
          "--loglevel", "info", "run", "--token", token],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(_marker(proc.pid) + "\n")
+    except OSError:
+        pass
     _write_pidfile(proc.pid)
     print("[argo] named tunnel process started (pid %d)" % proc.pid, flush=True)
+    return proc.pid
 
 
 def _boot_all():
     # NOTE: Streamlit re-executes this script on every rerun/code update, and
-    # module-level guards do not reliably survive that. Everything below is
-    # therefore idempotent via the filesystem: never start a second server or
-    # a second tunnel while the previous ones are alive.
-    #
+    # module-level guards do not reliably survive that, while reruns can also
+    # overlap in time. The lock serializes boots; the checks below make each
+    # boot idempotent via the filesystem: never a second server, never a
+    # second tunnel while the previous ones are alive.
+    if not _take_boot_lock(timeout=180):
+        print("[argo] boot lock busy, skipping this boot", flush=True)
+        return
+    try:
+        _boot_inner()
+    finally:
+        _release_boot_lock()
+
+
+def _boot_inner():
     # 1. local VLESS server — start only if the port is free
     if _port_in_use(server.LISTEN_PORT):
         print("[vless] port %d already bound, reusing existing server"
@@ -274,17 +308,21 @@ def _boot_all():
         _print_links(fixed_domain)
         return
     # 3b. quick tunnel — reuse the live one if there is one
-    domain = _existing_tunnel_domain(log_path)
-    if domain:
-        print("[argo] reusing existing quick tunnel: " + domain, flush=True)
-        server.tunnel_domain = domain
-        _print_links(domain)
-        return
+    pid = _read_pidfile()
+    if pid and _pid_alive(pid):
+        domain = _domain_for_pid(log_path, pid, timeout=15)
+        if domain:
+            print("[argo] reusing existing quick tunnel: " + domain, flush=True)
+            server.tunnel_domain = domain
+            _print_links(domain)
+            return
+        print("[argo] live tunnel pid %d has no domain in log yet; "
+              "starting a fresh tunnel" % pid, flush=True)
     for attempt in (1, 2, 3):
         print("[argo] starting quick tunnel (attempt %d/3) ..." % attempt,
               flush=True)
-        _run_tunnel(bot_path, server.LISTEN_PORT, log_path)
-        domain = _wait_domain(log_path, timeout=90)
+        pid = _run_tunnel(bot_path, server.LISTEN_PORT, log_path)
+        domain = _domain_for_pid(log_path, pid, timeout=90)
         if domain:
             server.tunnel_domain = domain
             _print_links(domain)
