@@ -13,6 +13,7 @@ Secrets must NEVER be rendered with st.* calls.
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -151,25 +152,103 @@ def _print_links(domain):
     print("", flush=True)
 
 
+PIDFILE = os.path.join(CACHE_DIR, "tunnel.pid")
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_pidfile():
+    try:
+        with open(PIDFILE, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_pidfile(pid):
+    try:
+        with open(PIDFILE, "w") as f:
+            f.write(str(pid))
+    except OSError as e:
+        print("[argo] pidfile write failed: %r" % (e,), flush=True)
+
+
+def _port_in_use(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def _existing_tunnel_domain(log_path):
+    """A tunnel process from an earlier boot in this container is still
+    alive: reuse its domain instead of opening a new tunnel (which would
+    change the public domain on every Streamlit script rerun)."""
+    pid = _read_pidfile()
+    if pid and _pid_alive(pid):
+        domain = _wait_domain(log_path, timeout=10)
+        if domain:
+            return domain
+        print("[argo] pidfile points to live pid %d but no domain in log; "
+              "starting a fresh tunnel" % pid, flush=True)
+    return None
+
+
+def _run_tunnel(bot_path, port, log_path):
+    try:
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+    except OSError:
+        pass
+    proc = subprocess.Popen(
+        [bot_path, "tunnel", "--edge-ip-version", "auto", "--no-autoupdate",
+         "--protocol", "http2", "--logfile", log_path,
+         "--loglevel", "info", "--url", "http://127.0.0.1:%d" % port],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+    _write_pidfile(proc.pid)
+    print("[argo] tunnel process started (pid %d)" % proc.pid, flush=True)
+
+
 def _run_named_tunnel(bot_path, token, log_path):
     try:
         if os.path.exists(log_path):
             os.unlink(log_path)
     except OSError:
         pass
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [bot_path, "tunnel", "--no-autoupdate", "--logfile", log_path,
          "--loglevel", "info", "run", "--token", token],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True)
-    print("[argo] named tunnel process started", flush=True)
+    _write_pidfile(proc.pid)
+    print("[argo] named tunnel process started (pid %d)" % proc.pid, flush=True)
 
 
 def _boot_all():
-    # 1. local VLESS server
-    threading.Thread(target=server.run, daemon=True,
-                     name="vless-server").start()
-    time.sleep(1)
+    # NOTE: Streamlit re-executes this script on every rerun/code update, and
+    # module-level guards do not reliably survive that. Everything below is
+    # therefore idempotent via the filesystem: never start a second server or
+    # a second tunnel while the previous ones are alive.
+    #
+    # 1. local VLESS server — start only if the port is free
+    if _port_in_use(server.LISTEN_PORT):
+        print("[vless] port %d already bound, reusing existing server"
+              % server.LISTEN_PORT, flush=True)
+    else:
+        threading.Thread(target=server.run, daemon=True,
+                         name="vless-server").start()
+        time.sleep(1)
     # 2. cloudflared binary (reuse if already cached and executable)
     bot_path = os.path.join(CACHE_DIR, "cfbin")
     log_path = os.path.join(CACHE_DIR, "boot.log")
@@ -183,12 +262,24 @@ def _boot_all():
     token = os.environ.get("TUNNEL_TOKEN", "")
     fixed_domain = os.environ.get("TUNNEL_DOMAIN", "")
     if token and fixed_domain:
-        print("[argo] starting NAMED tunnel for " + fixed_domain, flush=True)
-        _run_named_tunnel(bot_path, token, log_path)
+        pid = _read_pidfile()
+        if pid and _pid_alive(pid):
+            print("[argo] reusing existing named tunnel (pid %d)" % pid,
+                  flush=True)
+        else:
+            print("[argo] starting NAMED tunnel for " + fixed_domain,
+                  flush=True)
+            _run_named_tunnel(bot_path, token, log_path)
         server.tunnel_domain = fixed_domain
         _print_links(fixed_domain)
         return
-    # 3b. quick tunnel (3 attempts like the Node build)
+    # 3b. quick tunnel — reuse the live one if there is one
+    domain = _existing_tunnel_domain(log_path)
+    if domain:
+        print("[argo] reusing existing quick tunnel: " + domain, flush=True)
+        server.tunnel_domain = domain
+        _print_links(domain)
+        return
     for attempt in (1, 2, 3):
         print("[argo] starting quick tunnel (attempt %d/3) ..." % attempt,
               flush=True)
