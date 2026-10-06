@@ -274,11 +274,35 @@ def _boot_all():
         _release_boot_lock()
 
 
+def _my_server_thread_alive():
+    # Process-local truth (unlike module globals across Streamlit reruns).
+    return any(t.name == "vless-server" and t.is_alive()
+               for t in threading.enumerate())
+
+
+def _write_domain_file(domain):
+    # The authoritative tunnel domain. server.py reads this on every /sub
+    # request so even a server thread from an older boot/process serves the
+    # current domain.
+    try:
+        with open(os.path.join(CACHE_DIR, "domain.txt"), "w") as f:
+            f.write(domain)
+    except OSError as e:
+        print("[argo] domain file write failed: %r" % (e,), flush=True)
+
+
+def _set_domain(domain):
+    server.tunnel_domain = domain
+    _write_domain_file(domain)
+
+
 def _boot_inner():
-    # 1. local VLESS server — start only if the port is free
-    if _port_in_use(server.LISTEN_PORT):
-        print("[vless] port %d already bound, reusing existing server"
-              % server.LISTEN_PORT, flush=True)
+    # 1. local VLESS server — one thread per process. server.run() binds if
+    # the port is free, otherwise standbys and takes over when the older
+    # process (rolling restart) releases it.
+    if _my_server_thread_alive():
+        print("[vless] server thread already running in this process",
+              flush=True)
     else:
         threading.Thread(target=server.run, daemon=True,
                          name="vless-server").start()
@@ -304,7 +328,7 @@ def _boot_inner():
             print("[argo] starting NAMED tunnel for " + fixed_domain,
                   flush=True)
             _run_named_tunnel(bot_path, token, log_path)
-        server.tunnel_domain = fixed_domain
+        _set_domain(fixed_domain)
         _print_links(fixed_domain)
         return
     # 3b. quick tunnel — reuse the live one if there is one
@@ -313,7 +337,7 @@ def _boot_inner():
         domain = _domain_for_pid(log_path, pid, timeout=15)
         if domain:
             print("[argo] reusing existing quick tunnel: " + domain, flush=True)
-            server.tunnel_domain = domain
+            _set_domain(domain)
             _print_links(domain)
             return
         print("[argo] live tunnel pid %d has no domain in log yet; "
@@ -324,7 +348,7 @@ def _boot_inner():
         pid = _run_tunnel(bot_path, server.LISTEN_PORT, log_path)
         domain = _domain_for_pid(log_path, pid, timeout=90)
         if domain:
-            server.tunnel_domain = domain
+            _set_domain(domain)
             _print_links(domain)
             return
         print("[argo] no domain appeared, retrying", flush=True)
