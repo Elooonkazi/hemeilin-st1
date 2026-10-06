@@ -33,8 +33,23 @@ if not VLESS_UUID:
 if not WS_PATH:
     WS_PATH = "/api/v1/" + VLESS_UUID[:8]
 
-# Set by app.py once the quick tunnel is up; read by the /sub handler.
+# Set by app.py once the tunnel is up; read by the /sub handler.
+# NOTE: Streamlit does rolling restarts — an old process may keep serving
+# while a new one boots (shared net namespace). In-memory state therefore
+# goes stale across processes. The authoritative domain lives on disk
+# (written by app.py); the /sub handler reads it on every request.
 tunnel_domain = None
+
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "stnode")
+
+
+def disk_tunnel_domain():
+    try:
+        with open(os.path.join(_CACHE_DIR, "domain.txt"), "r") as f:
+            d = f.read().strip()
+            return d or None
+    except OSError:
+        return None
 
 DECOY = (b"<!DOCTYPE html>\n"
          b'<html lang="en"><head><meta charset="utf-8">'
@@ -378,7 +393,7 @@ def handle_client(conn):
                 headers[k.strip().lower()] = v.strip()
 
         if path == SUB_PATH:
-            domain = tunnel_domain
+            domain = disk_tunnel_domain() or tunnel_domain
             if not domain:
                 body = b"tunnel not ready yet, try again in a few seconds\n"
                 conn.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -423,14 +438,24 @@ def handle_client(conn):
 
 
 def run():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind(("127.0.0.1", LISTEN_PORT))
-    except OSError as e:
-        print("[vless] bind failed (another server owns the port?), "
-              "not starting: %r" % (e,), flush=True)
-        return
+    # Standby takeover: if the port is held (e.g. by an older app process
+    # during a rolling restart), keep retrying — when the old process dies,
+    # this one binds and takes over instead of leaving a gap with no server.
+    import time as _time
+    while True:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", LISTEN_PORT))
+            break
+        except OSError:
+            try:
+                srv.close()
+            except OSError:
+                pass
+            print("[vless] port %d busy, retrying in 30s (standby)"
+                  % LISTEN_PORT, flush=True)
+            _time.sleep(30)
     srv.listen(128)
     print("[vless] listening on 127.0.0.1:%d  ws_path=%s sub_path=%s" %
           (LISTEN_PORT, WS_PATH, SUB_PATH), flush=True)
